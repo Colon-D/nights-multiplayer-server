@@ -128,12 +128,16 @@ fn send<T: Serialize>(stream: &mut TcpStream, data: &T) -> io::Result<()> {
     Ok(())
 }
 
-fn send_udp<T: Serialize>(socket: &mut UdpSocket, data: &T) -> io::Result<()> {
+fn send_udp<T: Serialize>(
+    socket: &UdpSocket,
+    socket_addr: SocketAddr,
+    data: &T,
+) -> io::Result<()> {
     // serialize data
     let serialized = serde_json::to_string(data).unwrap();
 
     // send serialized data
-    socket.send(serialized.as_bytes())?;
+    socket.send_to(serialized.as_bytes(), socket_addr)?;
     Ok(())
 }
 
@@ -173,7 +177,9 @@ fn init_client(
 }
 
 fn handle_client(
+    udp_socket: Arc<UdpSocket>,
     stream: &mut TcpStream,
+    udp_socket_addr: SocketAddr,
     index: usize,
     clients: &Arc<Mutex<Clients>>,
 ) -> io::Result<()> {
@@ -191,6 +197,25 @@ fn handle_client(
         //     },
         // };
 
+        // check TCP stream to see if client is still connected, return if disconnected
+        let mut buffer = [0; 1024];
+        stream.set_nonblocking(true)?;
+        match stream.peek(&mut buffer) {
+            Ok(0) => {
+                return Ok(());
+            }
+            Ok(_) => {
+                // empty buffer
+                stream.read(&mut buffer)?;
+            }
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::WouldBlock {
+                    return Err(e);
+                }
+            }
+        }
+        stream.set_nonblocking(false)?;
+
         let id_to_data = {
             let mut clients = clients.lock().unwrap();
             // insert into clients (udp now)
@@ -198,7 +223,7 @@ fn handle_client(
             // serialize clients
             clients.id_to_data.clone()
         };
-        send(stream, &id_to_data)?;
+        send_udp(&udp_socket, udp_socket_addr, &id_to_data)?;
     }
 }
 
@@ -220,39 +245,50 @@ fn main() -> std::io::Result<()> {
     let mut index = 0;
 
     let listener = TcpListener::bind(&args.bind_address)?;
-    let udp_socket = UdpSocket::bind(&args.bind_address)?;
+    let udp_socket = Arc::new(UdpSocket::bind(&args.bind_address)?);
 
     // udp thread
-    let clients_udp = clients.clone();
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_millis(1000 / 60));
+    let udp_recv_thread_clients = clients.clone();
+    let udp_recv_thread_udp_socket = udp_socket.clone();
+    thread::spawn(move || {
+        let clients = udp_recv_thread_clients;
+        let udp_socket = udp_recv_thread_udp_socket;
+        loop {
+            // recv threads shouldn't wait
+            //thread::sleep(Duration::from_millis(1000 / 60));
 
-        let (data, remote) = match recv_udp(&udp_socket) {
-            Ok(v) => v,
-            Err(e) => {
-                match e {
-                    DataError::IoError(e) => {
-                        println!("udp error: {}", e);
+            let (data, remote) = match recv_udp(&udp_socket) {
+                Ok(v) => v,
+                Err(e) => {
+                    match e {
+                        DataError::IoError(e) => {
+                            println!("udp error: {}", e);
+                        }
+                        DataError::JsonError(e) => {
+                            println!("udp error: {}", e);
+                        }
                     }
-                    DataError::JsonError(e) => {
-                        println!("udp error: {}", e);
-                    }
+                    continue;
                 }
-                continue;
-            }
-        };
-        let mut clients = clients_udp.lock().unwrap();
-        let id = match clients.udp_addr_to_id.get(&remote) {
-            Some(v) => *v,
-            None => continue,
-        };
-        clients.id_to_data.insert(id, data);
+            };
+            let mut clients = clients.lock().unwrap();
+
+            // todo: data received, but not put into data, why?
+            // since udp sending port is different than receiving on the client
+
+            let id = match clients.udp_addr_to_id.get(&remote) {
+                Some(v) => *v,
+                None => continue,
+            };
+            clients.id_to_data.insert(id, data);
+        }
     });
 
     // accept incoming connections and spawn a thread for each
     for stream in listener.incoming() {
         let mut stream = stream.unwrap();
         let clients = clients.clone();
+        let udp_socket = udp_socket.clone();
 
         thread::spawn(move || {
             println!(
@@ -262,7 +298,8 @@ fn main() -> std::io::Result<()> {
             );
 
             let udp_socket_addr = init_client(&mut stream, index, &clients).unwrap();
-            handle_client(&mut stream, index, &clients);
+            println!("client {} initialized", index);
+            handle_client(udp_socket, &mut stream, udp_socket_addr, index, &clients);
             println!("client {} disconnected", index);
             // client disconnected, remove from clients
             let mut clients = clients.lock().unwrap();
